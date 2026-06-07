@@ -1,0 +1,5 @@
+# Built binary
+/blackwell-vram-temp
+
+# Object files
+*.o
