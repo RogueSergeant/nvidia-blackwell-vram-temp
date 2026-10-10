@@ -57,8 +57,9 @@ sudo setcap cap_sys_admin+ep ~/.local/bin/blackwell-vram-temp
 
 The binary takes no arguments and only issues fixed read-only register ops, but
 `CAP_SYS_ADMIN` is a broad capability; decide whether you are comfortable with
-it. Rebuilding or re-copying the binary drops the capability, so re-run
-`setcap` after `make install`.
+it. The capability is stored on the file, so it survives reboots and driver
+updates, but replacing the binary drops it. Use `make install-cap` to install
+and reapply it in one step.
 
 ```
 $ sudo ./blackwell-vram-temp
@@ -191,6 +192,7 @@ Optionally install into `~/.local/bin`:
 
 ```sh
 make install        # copies the binary to ~/.local/bin/blackwell-vram-temp
+make install-cap    # same, then sudo setcap cap_sys_admin+ep (driver 615+)
 ```
 
 Clean up:
