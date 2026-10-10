@@ -1,16 +1,24 @@
 /*
  * blackwell_vram_temp.c — read RTX 5090 (GB202 / Blackwell) GDDR7 memory
- * temperature via the RM User Shared Data (RUSD) buffer. Open kernel module,
- * driver 610.43.02.
+ * temperature. Open kernel module, drivers 610.x and 615.x.
+ *
+ * Two sources, tried in order:
+ *
+ *   1. RUSD (RM User Shared Data, NV00DE) buffer — rootless. Driver 610.43.02's
+ *      GSP firmware publishes temperatures[RUSD_TEMPERATURE_TYPE_MEMORY] here.
+ *      615.71.09's firmware leaves that slot INVALID (timestamp 0) on GeForce
+ *      while still filling the GPU slot, so this path returns nothing there.
+ *
+ *   2. GDDR7 DQR registers in BAR0, read through the driver's own
+ *      NV2080_CTRL_CMD_GPU_EXEC_REG_OPS control — needs CAP_SYS_ADMIN.
+ *      Independent of the GSP firmware, so it works on 615.x.
  *
  * SELF-CONTAINED build (no NVIDIA SDK, no -I, no /tmp/ogkm clone):
  *
  *     gcc -O2 -Wall blackwell_vram_temp.c -o blackwell_vram_temp
  *
- * This is a vendored single-file version of the reference gddr7_rusd.c (which
- * needed -I/tmp/ogkm/src/common/sdk/nvidia/inc). The minimal subset of the
- * NVIDIA 610.43.02 SDK headers that the reference pulled in has been inlined
- * below, VERBATIM where it affects ABI/layout:
+ * The minimal subset of the NVIDIA 610.43.02 SDK headers needed has been
+ * inlined below, VERBATIM where it affects ABI/layout:
  *
  *   - Nv base types (nvtypes.h): NvU8/16/32/64, NvS32, NvV32, NvHandle, NvBool,
  *     NvP64, plus NV_ALIGN_BYTES / NV_DECLARE_ALIGNED.
@@ -22,6 +30,7 @@
  *     the RUSD_TEMPERATURE_TYPE_* enum, the seqlock validity macro
  *     RUSD_SEQ_DATA_VALID, RUSD_TIMESTAMP_INVALID, the poll-mask bits, and
  *     NV00DE_ALLOC_PARAMETERS (class/cl00de.h).
+ *   - NV2080_CTRL_GPU_REG_OP / EXEC_REG_OPS params (ctrl2080gpu.h).
  *
  * Because the full struct is reproduced (not hand-offset), the compiler still
  * computes the byte-exact offset of temperatures[RUSD_TEMPERATURE_TYPE_MEMORY]
@@ -29,9 +38,9 @@
  * observed from the real 610.43.02 headers, so any accidental layout drift in
  * the vendored copy fails the build instead of reading the wrong bytes.
  *
- * Behavior is identical to the reference: alloc client->device->subdevice,
- * alloc NV00DE with POLL_THERMAL, REQUEST_DATA_POLL, MAP_MEMORY + mmap,
- * seqlock-read temperatures[MEMORY], convert raw NvSFXP24_8 / 256.0 -> Celsius.
+ * 615.71.09 adds RUSD_MEM_BANK_REMAP memBankRemap after memRowRemap (struct
+ * grows to 3184), but everything up to and including temperatures[] is
+ * unchanged, so the 610 layout still reads the right slot on 615.
  */
 #include <stdio.h>
 #include <stddef.h>
@@ -574,11 +583,48 @@ typedef struct {
     NvU32 subDeviceId;
 } NV2080_ALLOC_PARAMETERS;
 
+/* ---- GPU register ops (ctrl/ctrl2080/ctrl2080gpu.h) ---- */
+#define NV2080_CTRL_CMD_GPU_EXEC_REG_OPS        0x20800122U
+#define NV2080_CTRL_GPU_REG_OP_READ_32          0x00U
+#define NV2080_CTRL_GPU_REG_OP_TYPE_GLOBAL      0x00U
+#define NV2080_CTRL_GPU_REG_OP_STATUS_SUCCESS   0x00U
+
+typedef struct {
+    NvU8  regOp;
+    NvU8  regType;
+    NvU8  regStatus;
+    NvU8  regQuad;
+    NvU32 regGroupMask;
+    NvU32 regSubGroupMask;
+    NvU32 regOffset;
+    NvU32 regValueHi;
+    NvU32 regValueLo;
+    NvU32 regAndNMaskHi;
+    NvU32 regAndNMaskLo;
+} NV2080_CTRL_GPU_REG_OP;
+
+typedef struct {
+    NvU32 flags;
+    NvU64 route __attribute__((aligned(8)));
+} NV2080_CTRL_GR_ROUTE_INFO;
+
+typedef struct {
+    NvHandle hClientTarget;
+    NvHandle hChannelTarget;
+    NvU32    bNonTransactional;
+    NvU32    reserved00[2];
+    NvU32    regOpCount;
+    NvP64    regOps __attribute__((aligned(8)));
+    NV2080_CTRL_GR_ROUTE_INFO grRouteInfo __attribute__((aligned(8)));
+} NV2080_CTRL_GPU_EXEC_REG_OPS_PARAMS;
+
 /* ---- compile-time ABI checks ---- */
 _Static_assert(sizeof(NVOS21_PARAMETERS) == 32, "NVOS21 size");
 _Static_assert(sizeof(NVOS54_PARAMETERS) == 32, "NVOS54 size");
 _Static_assert(sizeof(NVOS00_PARAMETERS) == 16, "NVOS00 size");
 _Static_assert(sizeof(NVOS33_PARAMETERS) == 48, "NVOS33 size");
+_Static_assert(sizeof(NV2080_CTRL_GPU_REG_OP) == 32, "REG_OP size");
+_Static_assert(sizeof(NV2080_CTRL_GPU_EXEC_REG_OPS_PARAMS) == 48, "EXEC_REG_OPS size");
 
 /* request code encoding: _IOC(dir=3,type='F',nr,size) */
 #define NV_IOWR(nr, type) \
@@ -687,71 +733,224 @@ static void msleep(long ms)
     nanosleep(&ts, NULL);
 }
 
-int main(void)
+/* ===== GDDR7 DQR register fallback (driver 615+) =====
+ *
+ * From 615.71.09 the GSP firmware no longer publishes the MEMORY slot in the
+ * RUSD buffer on GeForce. The per-device GDDR7 temperature codes are still
+ * readable from the frame-buffer partition (FBPA) registers. Register offsets
+ * and decoding are taken from gputemps
+ * (github.com/ThomasBaruzier/gddr6-core-junction-vram-temps, src/sensor.c).
+ *
+ * Instead of mapping BAR0 through /dev/mem (blocked by CONFIG_IO_STRICT_DEVMEM
+ * while nvidia owns the region), the registers are read through the driver's
+ * own NV2080_CTRL_CMD_GPU_EXEC_REG_OPS control. That control is
+ * non-privileged, but CPU-RM only lets a caller past its register allowlist
+ * when osIsAdministrator() is true, i.e. capable(CAP_SYS_ADMIN). Without it
+ * every op comes back with a non-zero regStatus. */
+
+#define GDDR7_DQR_OFFSET            0x009024C0u
+#define GDDR7_DQR_VALID_OFFSET      0x10u
+#define GDDR7_DQR_STRIDE            0x4000u
+#define GDDR7_DQR_SUBREGISTER_COUNT 4u
+#define GDDR7_DQR_VALID_SHIFT       24u
+#define GDDR7_MAX_FBPA_COUNT        16u
+#define GDDR7_CLAMSHELL_FBPA_COUNT  8u
+
+#define GDDR7_STRAP_BROADCAST_OFFSET 0x009A0200u
+#define GDDR7_STRAP_X16_BIT          22u
+
+#define GDDR7_TEMP_CODE_SHIFT       16u
+#define GDDR7_TEMP_CODE_MASK        0xFFu
+#define GDDR7_ZERO_C_CODE           20u
+#define GDDR7_CODE_MIN              21u
+#define GDDR7_CODE_MAX              80u
+#define GDDR7_DEGREES_PER_CODE      2
+
+#define GDDR7_POISON_MASK           0xFFFF0000u
+#define GDDR7_POISON_VALUE          0xBADF0000u
+
+/* Ops per EXEC_REG_OPS call; keeps the GSP RPC payload small. */
+#define REG_OPS_BATCH               32
+
+static int gddr7_poisoned(NvU32 raw)
+{
+    return raw == 0xFFFFFFFFu || (raw & GDDR7_POISON_MASK) == GDDR7_POISON_VALUE;
+}
+
+/* Returns 1 and sets *celsius if raw holds a plausible temperature code. */
+static int gddr7_decode(NvU32 raw, int *celsius)
+{
+    if (gddr7_poisoned(raw))
+        return 0;
+    unsigned code = (raw >> GDDR7_TEMP_CODE_SHIFT) & GDDR7_TEMP_CODE_MASK;
+    if (code < GDDR7_CODE_MIN || code > GDDR7_CODE_MAX)
+        return 0;
+    *celsius = ((int)code - (int)GDDR7_ZERO_C_CODE) * GDDR7_DEGREES_PER_CODE;
+    return 1;
+}
+
+/* Read n 32-bit registers. Per-op status lands in status[] (0 = success).
+ * Returns -1 if the control itself failed. */
+static int reg_read32(int fd, NvHandle hClient, NvHandle hSubdevice,
+                      const NvU32 *offsets, NvU32 *values, NvU8 *status, int n)
+{
+    for (int base = 0; base < n; base += REG_OPS_BATCH) {
+        int cnt = (n - base < REG_OPS_BATCH) ? n - base : REG_OPS_BATCH;
+        NV2080_CTRL_GPU_REG_OP ops[REG_OPS_BATCH];
+        memset(ops, 0, sizeof(ops));
+        for (int i = 0; i < cnt; ++i) {
+            ops[i].regOp         = NV2080_CTRL_GPU_REG_OP_READ_32;
+            ops[i].regType       = NV2080_CTRL_GPU_REG_OP_TYPE_GLOBAL;
+            ops[i].regOffset     = offsets[base + i];
+            ops[i].regAndNMaskLo = 0xFFFFFFFFu;
+        }
+
+        NV2080_CTRL_GPU_EXEC_REG_OPS_PARAMS p;
+        memset(&p, 0, sizeof(p));
+        p.bNonTransactional = 1;   /* report per-op status instead of failing the batch */
+        p.regOpCount        = (NvU32)cnt;
+        p.regOps            = (NvP64)(uintptr_t)ops;
+        if (rm_control(fd, hClient, hSubdevice, NV2080_CTRL_CMD_GPU_EXEC_REG_OPS,
+                       &p, sizeof(p), "GPU_EXEC_REG_OPS") != 0)
+            return -1;
+
+        for (int i = 0; i < cnt; ++i) {
+            values[base + i] = ops[i].regValueLo;
+            status[base + i] = ops[i].regStatus;
+        }
+    }
+    return 0;
+}
+
+enum {
+    DQR_OK = 0,
+    DQR_NO_PERMISSION,   /* RM refused the register reads (needs CAP_SYS_ADMIN) */
+    DQR_NO_DATA,         /* reads succeeded but no sensor held a valid code */
+    DQR_ERROR,           /* the control call itself failed */
+};
+
+/* Read every GDDR7 temperature code, print them per FBPA, and return the
+ * hottest in *hottest. */
+static int gddr7_dqr_read(int fd, NvHandle hClient, NvHandle hSubdevice,
+                          int *hottest, int *sensors)
+{
+    /* Pass 1: topology strap + the valid-mask register of every FBPA. */
+    NvU32 off[1 + GDDR7_MAX_FBPA_COUNT], val[1 + GDDR7_MAX_FBPA_COUNT];
+    NvU8  st[1 + GDDR7_MAX_FBPA_COUNT];
+    int n = 0;
+    off[n++] = GDDR7_STRAP_BROADCAST_OFFSET;
+    for (unsigned f = 0; f < GDDR7_MAX_FBPA_COUNT; ++f)
+        off[n++] = GDDR7_DQR_OFFSET + f * GDDR7_DQR_STRIDE + GDDR7_DQR_VALID_OFFSET;
+    if (reg_read32(fd, hClient, hSubdevice, off, val, st, n) != 0)
+        return DQR_ERROR;
+
+    int allowed = 0;
+    for (int i = 0; i < n; ++i)
+        if (st[i] == NV2080_CTRL_GPU_REG_OP_STATUS_SUCCESS)
+            allowed = 1;
+    if (!allowed)
+        return DQR_NO_PERMISSION;
+
+    /* Clamshell boards wire 8 FBPAs; an unreadable strap falls back to
+     * scanning all 16 and letting the valid masks decide. */
+    unsigned fbpaCount = GDDR7_MAX_FBPA_COUNT;
+    const char *topo = "unknown";
+    if (st[0] == NV2080_CTRL_GPU_REG_OP_STATUS_SUCCESS && val[0] != 0 && !gddr7_poisoned(val[0])) {
+        if (val[0] & (1u << GDDR7_STRAP_X16_BIT)) {
+            fbpaCount = GDDR7_CLAMSHELL_FBPA_COUNT;
+            topo = "clamshell";
+        } else {
+            topo = "standard";
+        }
+    }
+    printf("GDDR7 DQR registers: strap=0x%08x (%s), scanning %u FBPAs\n",
+           val[0], topo, fbpaCount);
+
+    /* Pass 2: the four temperature sub-registers of each readable FBPA. */
+    NvU32 doff[GDDR7_MAX_FBPA_COUNT * GDDR7_DQR_SUBREGISTER_COUNT];
+    NvU32 dval[GDDR7_MAX_FBPA_COUNT * GDDR7_DQR_SUBREGISTER_COUNT];
+    NvU8  dst[GDDR7_MAX_FBPA_COUNT * GDDR7_DQR_SUBREGISTER_COUNT];
+    unsigned fbpaOf[GDDR7_MAX_FBPA_COUNT * GDDR7_DQR_SUBREGISTER_COUNT];
+    int dn = 0;
+    for (unsigned f = 0; f < fbpaCount; ++f) {
+        NvU32 mask = val[1 + f];
+        if (st[1 + f] != NV2080_CTRL_GPU_REG_OP_STATUS_SUCCESS || gddr7_poisoned(mask))
+            continue;
+        for (unsigned k = 0; k < GDDR7_DQR_SUBREGISTER_COUNT; ++k) {
+            if (!(mask & (1u << (GDDR7_DQR_VALID_SHIFT + k))))
+                continue;
+            fbpaOf[dn] = f;
+            doff[dn++] = GDDR7_DQR_OFFSET + f * GDDR7_DQR_STRIDE + k * 4u;
+        }
+    }
+    if (dn > 0 && reg_read32(fd, hClient, hSubdevice, doff, dval, dst, dn) != 0)
+        return DQR_ERROR;
+
+    int skipped = 0;
+    for (unsigned f = 0; f < fbpaCount; ++f) {
+        int present = 0;
+        for (int i = 0; i < dn; ++i)
+            if (fbpaOf[i] == f)
+                present = 1;
+        if (!present) {
+            printf(skipped++ ? " %u" : "  no valid sensors on FBPA %u", f);
+        }
+    }
+    if (skipped)
+        printf("\n");
+
+    *hottest = -1000;
+    *sensors = 0;
+    for (int i = 0; i < dn; ) {
+        unsigned f = fbpaOf[i];
+        printf("  FBPA %2u:", f);
+        for (; i < dn && fbpaOf[i] == f; ++i) {
+            int c;
+            if (dst[i] == NV2080_CTRL_GPU_REG_OP_STATUS_SUCCESS && gddr7_decode(dval[i], &c)) {
+                printf(" %3d C", c);
+                if (c > *hottest)
+                    *hottest = c;
+                ++*sensors;
+            } else {
+                printf("   n/a");
+            }
+        }
+        printf("\n");
+    }
+    return *sensors > 0 ? DQR_OK : DQR_NO_DATA;
+}
+
+/* ===== RUSD path (driver 610.x) ===== */
+
+/* Alloc NV00DE under the subdevice, map its shared buffer and poll the
+ * temperature slots. Returns -1 if the buffer could not be set up. */
+static int rusd_read(int fd, NvHandle hClient, NvHandle hSubdevice,
+                     RUSD_TEMPERATURE *gpuT, int *gpuValid,
+                     RUSD_TEMPERATURE *memT, int *memValid)
 {
     const char *dev = "/dev/nvidiactl";
-    int fd = open(dev, O_RDWR);
-    if (fd < 0) {
-        fprintf(stderr, "open(%s) failed: %s\n", dev, strerror(errno));
-        return 2;
-    }
-
-    /* Hold /dev/nvidia0 open so the GPU is "accessible" to this process for a
-     * non-kernel client to allocate a Device (osIsGpuAccessible scans the fd
-     * table). All RM escapes still go on the /dev/nvidiactl fd. */
-    const char *gpudev = "/dev/nvidia0";
-    int gfd = open(gpudev, O_RDWR);
-    if (gfd < 0) {
-        fprintf(stderr, "open(%s) failed: %s\n", gpudev, strerror(errno));
-        close(fd);
-        return 2;
-    }
-
-    NvHandle hClient    = 0;            /* auto-generated by RM */
-    NvHandle hDevice    = 0xD0D00001;
-    NvHandle hSubdevice = 0x5D000001;
-    NvHandle hRusd      = 0x00DE0001;
-    int rc = 3;
+    NvHandle hRusd = 0x00DE0001;
     void *map = MAP_FAILED;
     size_t maplen = 0;
     int mfd = -1;
+    int ret = -1;
 
-    /* Step 1: root client (handle auto-generated; read back) */
-    NV0000_ALLOC_PARAMETERS clientParms;
-    memset(&clientParms, 0, sizeof(clientParms));
-    if (rm_alloc(fd, 0, 0, &hClient, NV01_ROOT_CLIENT,
-                 &clientParms, sizeof(clientParms), "client") != 0)
-        goto out_close;
-    printf("Allocated client handle:    0x%08x\n", hClient);
+    *gpuValid = *memValid = 0;
+    memset(gpuT, 0, sizeof(*gpuT));
+    memset(memT, 0, sizeof(*memT));
 
-    /* Step 2: device */
-    NV0080_ALLOC_PARAMETERS devParms;
-    memset(&devParms, 0, sizeof(devParms));
-    devParms.deviceId = 0;
-    if (rm_alloc(fd, hClient, hClient, &hDevice, NV01_DEVICE_0,
-                 &devParms, sizeof(devParms), "device") != 0)
-        goto out_free_client;
-
-    /* Step 3: subdevice */
-    NV2080_ALLOC_PARAMETERS subParms;
-    memset(&subParms, 0, sizeof(subParms));
-    subParms.subDeviceId = 0;
-    if (rm_alloc(fd, hClient, hDevice, &hSubdevice, NV20_SUBDEVICE_0,
-                 &subParms, sizeof(subParms), "subdevice") != 0)
-        goto out_free_device;
-
-    /* Step 4: alloc NV00DE (RM_USER_SHARED_DATA) under the subdevice, asking
-     * for thermal polling up front. */
+    /* Alloc NV00DE (RM_USER_SHARED_DATA) under the subdevice, asking for
+     * thermal polling up front. */
     NV00DE_ALLOC_PARAMETERS rusdParms;
     memset(&rusdParms, 0, sizeof(rusdParms));
     rusdParms.polledDataMask = NV00DE_RUSD_POLL_THERMAL;   /* 0x10 */
     if (rm_alloc(fd, hClient, hSubdevice, &hRusd, RM_USER_SHARED_DATA,
                  &rusdParms, sizeof(rusdParms), "rusd(NV00DE)") != 0)
-        goto out_free_sub;
+        return -1;
     printf("Allocated NV00DE handle:     0x%08x (class 0x%02x)\n",
            hRusd, RM_USER_SHARED_DATA);
 
-    /* Step 5: (re)request the thermal poll feature. */
+    /* (Re)request the thermal poll feature. */
     RUSD_REQUEST_DATA_POLL_PARAMS poll;
     memset(&poll, 0, sizeof(poll));
     poll.polledDataMask = NV00DE_RUSD_POLL_THERMAL;
@@ -760,8 +959,8 @@ int main(void)
         goto out_free_rusd;
     printf("Requested POLL_THERMAL (0x%x) on NV00DE\n", NV00DE_RUSD_POLL_THERMAL);
 
-    /* Step 6: map the shared buffer into this process. System-memory mappings
-     * are associated with the control node, so the fd handed to RM (and then
+    /* Map the shared buffer into this process. System-memory mappings are
+     * associated with the control node, so the fd handed to RM (and then
      * mmap'd) must be a /dev/nvidiactl fd; use a dedicated one. */
     mfd = open(dev, O_RDWR);
     if (mfd < 0) {
@@ -807,16 +1006,20 @@ int main(void)
 
     volatile NV00DE_SHARED_DATA *sd = (volatile NV00DE_SHARED_DATA *)map;
 
-    /* Step 7: poll the buffer. RM's poller updates it in place on an interval,
-     * so the MEMORY slot may be INVALID for the first few hundred ms. Re-read
-     * (and occasionally re-request) for up to ~6 s. */
-    RUSD_TEMPERATURE memT, gpuT;
-    int memValid = 0, gpuValid = 0;
+    /* Poll the buffer. RM's poller updates it in place on an interval, so the
+     * MEMORY slot may be INVALID for the first few hundred ms. Re-read (and
+     * occasionally re-request) for up to ~6 s. Once the GPU slot is live, the
+     * poller has run; if MEMORY is still INVALID ~1.6 s after that, the
+     * firmware is not publishing it (615.x) and we stop waiting. */
     const int max_iter = 30;
+    const int grace_iter = 8;
+    int gpuLiveIters = 0;
     for (int i = 0; i < max_iter; ++i) {
-        gpuValid = rusd_read_temp(sd, RUSD_TEMPERATURE_TYPE_GPU,    &gpuT);
-        memValid = rusd_read_temp(sd, RUSD_TEMPERATURE_TYPE_MEMORY, &memT);
-        if (memValid)
+        *gpuValid = rusd_read_temp(sd, RUSD_TEMPERATURE_TYPE_GPU,    gpuT);
+        *memValid = rusd_read_temp(sd, RUSD_TEMPERATURE_TYPE_MEMORY, memT);
+        if (*memValid)
+            break;
+        if (*gpuValid && ++gpuLiveIters >= grace_iter)
             break;
         if ((i % 5) == 4) {
             /* keep the poll request fresh */
@@ -826,6 +1029,68 @@ int main(void)
         }
         msleep(200);
     }
+    ret = 0;
+
+    munmap(map, maplen);
+out_free_rusd:
+    if (mfd >= 0) close(mfd);
+    rm_free(fd, hClient, hSubdevice, hRusd);
+    return ret;
+}
+
+int main(void)
+{
+    const char *dev = "/dev/nvidiactl";
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "open(%s) failed: %s\n", dev, strerror(errno));
+        return 2;
+    }
+
+    /* Hold /dev/nvidia0 open so the GPU is "accessible" to this process for a
+     * non-kernel client to allocate a Device (osIsGpuAccessible scans the fd
+     * table). All RM escapes still go on the /dev/nvidiactl fd. */
+    const char *gpudev = "/dev/nvidia0";
+    int gfd = open(gpudev, O_RDWR);
+    if (gfd < 0) {
+        fprintf(stderr, "open(%s) failed: %s\n", gpudev, strerror(errno));
+        close(fd);
+        return 2;
+    }
+
+    NvHandle hClient    = 0;            /* auto-generated by RM */
+    NvHandle hDevice    = 0xD0D00001;
+    NvHandle hSubdevice = 0x5D000001;
+    int rc = 3;
+
+    /* Step 1: root client (handle auto-generated; read back) */
+    NV0000_ALLOC_PARAMETERS clientParms;
+    memset(&clientParms, 0, sizeof(clientParms));
+    if (rm_alloc(fd, 0, 0, &hClient, NV01_ROOT_CLIENT,
+                 &clientParms, sizeof(clientParms), "client") != 0)
+        goto out_close;
+    printf("Allocated client handle:    0x%08x\n", hClient);
+
+    /* Step 2: device */
+    NV0080_ALLOC_PARAMETERS devParms;
+    memset(&devParms, 0, sizeof(devParms));
+    devParms.deviceId = 0;
+    if (rm_alloc(fd, hClient, hClient, &hDevice, NV01_DEVICE_0,
+                 &devParms, sizeof(devParms), "device") != 0)
+        goto out_free_client;
+
+    /* Step 3: subdevice */
+    NV2080_ALLOC_PARAMETERS subParms;
+    memset(&subParms, 0, sizeof(subParms));
+    subParms.subDeviceId = 0;
+    if (rm_alloc(fd, hClient, hDevice, &hSubdevice, NV20_SUBDEVICE_0,
+                 &subParms, sizeof(subParms), "subdevice") != 0)
+        goto out_free_device;
+
+    /* Step 4: RUSD shared buffer (rootless; carries the MEMORY slot on 610.x). */
+    RUSD_TEMPERATURE memT, gpuT;
+    int memValid = 0, gpuValid = 0;
+    int rusdOk = rusd_read(fd, hClient, hSubdevice, &gpuT, &gpuValid, &memT, &memValid) == 0;
 
     /* Sanity: GPU-target temperature from the same buffer. */
     if (gpuValid) {
@@ -834,7 +1099,7 @@ int main(void)
                RUSD_TEMPERATURE_TYPE_GPU, type_name(RUSD_TEMPERATURE_TYPE_GPU),
                graw, (NvU32)graw, (double)graw / 256.0,
                (unsigned long long)gpuT.lastModifiedTimestamp);
-    } else {
+    } else if (rusdOk) {
         printf("GPU   temp [type %d %-13s]: <no valid sample>\n",
                RUSD_TEMPERATURE_TYPE_GPU, type_name(RUSD_TEMPERATURE_TYPE_GPU));
     }
@@ -849,24 +1114,36 @@ int main(void)
         printf("\nRESULT GDDR7_MEMORY_TEMP_C = %.3f  (raw NvSFXP24_8 = %d)\n",
                celsius, raw);
         rc = 0;
-    } else {
-        /* Buffer mapped but the MEMORY slot never populated. Report the raw
-         * sentinel/zero we saw (per guidance: this is the residual GSP risk on
-         * a GeForce SKU). */
-        NvS32 raw = (NvS32)memT.temperature;
-        printf("GDDR7 temp [type %d %-13s]: <no valid sample after poll>"
-               "  raw=%d (0x%08x) ts=0x%016llx\n",
-               RUSD_TEMPERATURE_TYPE_MEMORY, type_name(RUSD_TEMPERATURE_TYPE_MEMORY),
-               raw, (NvU32)raw,
-               (unsigned long long)memT.lastModifiedTimestamp);
-        printf("\nRESULT GDDR7_MEMORY_TEMP not populated (RUSD MEMORY slot stayed INVALID)\n");
-        rc = 10;   /* signal not_populated */
+        goto out_free_sub;
     }
 
-    if (map != MAP_FAILED)
-        munmap(map, maplen);
-out_free_rusd:
-    rm_free(fd, hClient, hSubdevice, hRusd);
+    if (rusdOk)
+        printf("GDDR7 temp [type %d %-13s]: <slot empty>"
+               "  ts=0x%016llx\n",
+               RUSD_TEMPERATURE_TYPE_MEMORY, type_name(RUSD_TEMPERATURE_TYPE_MEMORY),
+               (unsigned long long)memT.lastModifiedTimestamp);
+
+    /* Step 5: GDDR7 DQR registers (615.x; needs CAP_SYS_ADMIN). */
+    int hottest = 0, sensors = 0;
+    switch (gddr7_dqr_read(fd, hClient, hSubdevice, &hottest, &sensors)) {
+    case DQR_OK:
+        printf("\nRESULT GDDR7_MEMORY_TEMP_C = %.3f  (DQR registers, hottest of %d sensors)\n",
+               (double)hottest, sensors);
+        rc = 0;
+        break;
+    case DQR_NO_PERMISSION:
+        printf("\nRESULT GDDR7_MEMORY_TEMP not available: RUSD MEMORY slot is empty and the"
+               " register fallback needs CAP_SYS_ADMIN (run as root, or"
+               " setcap cap_sys_admin+ep on this binary)\n");
+        rc = 11;
+        break;
+    default:
+        printf("\nRESULT GDDR7_MEMORY_TEMP not populated (RUSD MEMORY slot empty, no valid"
+               " DQR sensor codes)\n");
+        rc = 10;
+        break;
+    }
+
 out_free_sub:
     rm_free(fd, hClient, hDevice, hSubdevice);
 out_free_device:
@@ -874,7 +1151,6 @@ out_free_device:
 out_free_client:
     rm_free(fd, hClient, hClient, hClient);
 out_close:
-    if (mfd >= 0) close(mfd);
     close(gfd);
     close(fd);
     return rc;

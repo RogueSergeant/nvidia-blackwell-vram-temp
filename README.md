@@ -1,7 +1,8 @@
 # blackwell-vram-temp
 
 **Read the GDDR7 memory temperature of an NVIDIA RTX 50-series (Blackwell) GPU
-on Linux — rootless, no kernel module of your own, no NVIDIA SDK.**
+on Linux — no kernel module of your own, no NVIDIA SDK. Rootless on driver
+610.x; needs `CAP_SYS_ADMIN` on 615.x (see [Driver 615 and later](#driver-615-and-later)).**
 
 On RTX 50 (Blackwell) consumer cards, `nvidia-smi` reports the memory junction
 temperature as `N/A`:
@@ -24,8 +25,64 @@ GDDR7 temp [type 1 MEMORY(GDDR7)]: raw=15104 (0x00003b00)  59.000 C
 RESULT GDDR7_MEMORY_TEMP_C = 59.000  (raw NvSFXP24_8 = 15104)
 ```
 
-No root. No `setuid`. No custom kernel module. It runs as your normal user
-against `/dev/nvidiactl` + `/dev/nvidia0`.
+On driver 610.x: no root, no `setuid`, no custom kernel module. It runs as
+your normal user against `/dev/nvidiactl` + `/dev/nvidia0`.
+
+---
+
+## Driver 615 and later
+
+From **615.71.09** the GSP firmware no longer writes the `MEMORY` slot of the
+RUSD buffer on GeForce. The `GPU` slot next to it is still live, the buffer
+layout up to `temperatures[]` is unchanged, and the open kernel module's RUSD
+code is identical to 610.43.02, so the change is inside the closed firmware.
+On 615 `nvidia-smi` also reports `GPU Current T.Limit Temp` as `N/A`.
+
+When the RUSD slot stays empty, the tool falls back to reading the GDDR7
+temperature codes directly from the frame-buffer partition (FBPA) "DQR"
+registers in BAR0. The register offsets and decoding come from
+[gputemps](https://github.com/ThomasBaruzier/gddr6-core-junction-vram-temps).
+Rather than mapping BAR0 through `/dev/mem` (which `CONFIG_IO_STRICT_DEVMEM`
+blocks while the nvidia driver owns the region, and which needs
+`iomem=relaxed`), the registers are read through the driver's own
+`NV2080_CTRL_CMD_GPU_EXEC_REG_OPS` control.
+
+That control skips its register allowlist only for `CAP_SYS_ADMIN`
+(`osIsAdministrator()` → `capable(CAP_SYS_ADMIN)`), so on 615 the tool must run
+as root or carry the capability:
+
+```sh
+sudo setcap cap_sys_admin+ep ~/.local/bin/blackwell-vram-temp
+```
+
+The binary takes no arguments and only issues fixed read-only register ops, but
+`CAP_SYS_ADMIN` is a broad capability; decide whether you are comfortable with
+it. Rebuilding or re-copying the binary drops the capability, so re-run
+`setcap` after `make install`.
+
+```
+$ sudo ./blackwell-vram-temp
+...
+GDDR7 temp [type 1 MEMORY(GDDR7)]: <slot empty>  ts=0x0000000000000000
+GDDR7 DQR registers: strap=0x069f9803 (standard), scanning 16 FBPAs
+  no valid sensors on FBPA 6 7 8 9 10 11 12 13 14 15
+  FBPA  0:  58 C  56 C  58 C  56 C
+  FBPA  1:  58 C  56 C  58 C  56 C
+  FBPA  2:  58 C  58 C  58 C  58 C
+  FBPA  3:  56 C  56 C  56 C  56 C
+  FBPA  4:  58 C  58 C  58 C  58 C
+  FBPA  5:  58 C  58 C  58 C  58 C
+
+RESULT GDDR7_MEMORY_TEMP_C = 58.000  (DQR registers, hottest of 24 sensors)
+```
+
+On the RTX 5090 tested, only FBPAs 0–5 set their valid bits (FBPAs 6 and 7
+read as the `0xBADF....` poison value). How those 24 codes map onto the card's
+16 GDDR7 packages is not established, so the result is the hottest *reported*
+sensor, not a guaranteed hottest package.
+
+The DQR value is the hottest valid sensor code. Codes are in 2 °C steps
+(`(code - 20) * 2`), so this path is coarser than the RUSD value.
 
 ---
 
@@ -108,14 +165,15 @@ on Blackwell GeForce. This is the core reason this tool has to exist:
 |---|---|---|
 | **NVML** (`nvmlDeviceGetTemperature`, `...GetFieldValues`) | The documented, supported telemetry API behind `nvidia-smi` | The `MEMORY` sensor / memory-temp field is **gated on GeForce** — returns `NVML_ERROR_NOT_SUPPORTED` / `N/A`. Present on data-center Blackwell, refused on consumer. |
 | **`THERMAL_SYSTEM_EXECUTE_V2`** (RM thermal ctrl) | Lower-level RM thermal control call | The Blackwell thermal-system provider exposes **no `MEMORY` target** — there is a GPU target but no memory channel to query through this path. |
-| **Root + thermal sysfs / privileged RM** | "Just run it as root" | Privilege **does not help** — the limitation is the absent query target, not a permission check. Root reads the same gated/empty surface. |
-| **BAR0 MMIO poke** (the `gddr6` approach) | Read the memory-temp register directly over the GPU's BAR0 register window | The fixed BAR0 register offsets used for GDDR6 on Ampere/Ada are **dead on Blackwell** — the readout moved/changed and the old offsets return nothing useful. |
+| **Root + thermal sysfs / privileged RM** | "Just run it as root" | For the thermal queries above, privilege **does not help** — the limitation is the absent query target, not a permission check. (Root does unlock the register fallback below.) |
+| **BAR0 MMIO poke** (the `gddr6` approach) | Read the memory-temp register directly over the GPU's BAR0 register window | The fixed BAR0 register offsets used for GDDR6 on Ampere/Ada are **dead on Blackwell**. GDDR7 codes live in different (FBPA DQR) registers, which this tool uses as its 615.x fallback — via the driver's `EXEC_REG_OPS` control, not `/dev/mem`. |
 | **SMBPBI** (SMBus Post-Box Interface) | Out-of-band BMC/management telemetry | **Out-of-band** — meant for server baseboard management controllers over SMBus, not reachable as an in-band path on a desktop GeForce. |
-| **RUSD / NV00DE** ← *this tool* | Shared-data buffer exposed by the open kernel module | **Works.** The `MEMORY` slot is populated by the GSP poller and mappable read-only by a normal user. |
+| **RUSD / NV00DE** ← *this tool, 610.x* | Shared-data buffer exposed by the open kernel module | **Works on 610.x.** The `MEMORY` slot is populated by the GSP poller and mappable read-only by a normal user. Empty from 615.71.09. |
+| **GDDR7 DQR registers via `EXEC_REG_OPS`** ← *this tool, 615.x* | Driver-mediated BAR0 register reads | **Works with `CAP_SYS_ADMIN`.** Does not depend on the GSP firmware. |
 
 The short version: on Blackwell GeForce the memory temperature is reachable
-**only** through the shared-data buffer, and only because the open kernel module
-publishes that ABI.
+rootless **only** through the shared-data buffer, and only on drivers whose
+firmware still publishes it.
 
 ---
 
@@ -151,12 +209,15 @@ make clean
 
 There are no flags. The tool opens the NVIDIA device nodes, sets up the RUSD
 buffer, polls until the `MEMORY` slot is valid (up to ~6 s on a cold buffer),
-prints both the GPU-target and GDDR7 memory temperatures, and exits.
+prints both the GPU-target and GDDR7 memory temperatures, and exits. If the
+`GPU` slot is live but `MEMORY` stays empty for ~1.6 s, it moves on to the DQR
+register fallback.
 
 **Permissions:** you need read/write access to `/dev/nvidiactl` and
 `/dev/nvidia0`. On a normal desktop with the proprietary/open driver installed,
 your interactive user already has this (the nodes are typically `0666`). **No
-root required.**
+root required on 610.x.** On 615.x the fallback needs `CAP_SYS_ADMIN` (see
+[Driver 615 and later](#driver-615-and-later)).
 
 **Exit codes:**
 
@@ -165,7 +226,8 @@ root required.**
 | `0` | Success — memory temperature read and printed |
 | `2` | Could not open `/dev/nvidiactl` or `/dev/nvidia0` |
 | `3` | RM allocation / setup failed |
-| `10` | Buffer mapped but the `MEMORY` slot never populated (see caveats) |
+| `10` | `MEMORY` slot empty and the DQR fallback found no valid sensor codes |
+| `11` | `MEMORY` slot empty and the DQR fallback was refused (needs `CAP_SYS_ADMIN`) |
 
 ### Sample output
 
@@ -192,9 +254,9 @@ for a fan-curve daemon, a Conky/Waybar widget, or a logging script.
 Tested on:
 
 - **GPU:** NVIDIA GeForce RTX 5090 (GB202, Blackwell)
-- **Driver:** `610.43.02`, **open** kernel module flavor
-  (`nvidia-open` / `open-gpu-kernel-modules`)
-- **OS / kernel:** Fedora / Bazzite, kernel **7.0**
+- **Driver:** `610.43.02` (RUSD path) and `615.71.09` (DQR fallback), **open**
+  kernel module flavor (`nvidia-open` / `open-gpu-kernel-modules`)
+- **OS / kernel:** Fedora / Bazzite, kernel **7.0** (610) and **7.2** (615)
 - **Arch:** x86-64
 
 It should work on other RTX 50 Blackwell GeForce cards (5070/5070 Ti/5080/etc.)
@@ -222,13 +284,15 @@ This tool is honest about what it is:
   **removed in hardware** on RTX 50. This tool gives you the GDDR7 *memory*
   temperature and the GPU-target temperature; it cannot give you Hot Spot,
   because nothing can. Don't file an issue asking for it.
-- **The `MEMORY` slot can stay empty (exit `10`).** RUSD is poller-driven; on a
-  cold buffer the memory slot may need a few hundred ms to populate, which is
-  why the tool retries. If it *never* populates on your SKU/driver, that's the
-  residual GSP-side gating risk — the interface worked but the value wasn't
-  published.
-- **Read-only.** The buffer is mapped `PROT_READ`; this tool only reads
-  telemetry. It does not and cannot change clocks, fan speeds, or power limits.
+- **The `MEMORY` slot can stay empty.** RUSD is poller-driven; on a cold buffer
+  the memory slot may need a few hundred ms to populate, which is why the tool
+  retries. From 615.71.09 it never populates on GeForce, and the tool falls
+  back to the DQR registers.
+- **The DQR decoding is reverse-engineered.** Offsets, the valid mask, the
+  poison value and the `(code - 20) * 2` scale come from gputemps, not from
+  NVIDIA documentation, and have 2 °C resolution.
+- **Read-only.** The buffer is mapped `PROT_READ` and the register path only
+  issues `READ_32` ops; this tool only reads telemetry. It does not and cannot change clocks, fan speeds, or power limits.
 
 ---
 
@@ -241,6 +305,9 @@ This builds directly on the work of others who chipped away at the same problem:
   original BAR0-MMIO approach to reading GDDR6 memory temperature on
   Ampere/Ada. That technique is what *doesn't* work on Blackwell (see the table
   above), and tracing *why* it broke is what motivated finding the RUSD path.
+- **[gputemps](https://github.com/ThomasBaruzier/gddr6-core-junction-vram-temps)**
+  — found the GDDR7 DQR register layout and decoding on Blackwell. The 615.x
+  fallback here uses its offsets and decode rules.
 - **[LibreHardwareMonitor PR #1878](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/pull/1878)**
   — added the Blackwell memory-temperature channel on **Windows**, confirming
   the sensor exists on GeForce and giving a cross-OS sanity check for the values
